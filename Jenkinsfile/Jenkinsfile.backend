@@ -1,0 +1,59 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            defaultValue: 'dev',
+            name: 'Environment'
+        )
+        choice(
+            choices: ['plan', 'apply', 'destroy'], 
+            name: 'Terraform_Action'
+        )
+    }
+
+    stages {
+        stage('Preparing') {
+            steps {
+                sh 'echo Preparing pipeline...'
+            }
+        }
+        stage('Git Pulling') {
+            steps {
+                // Replace with your repository URL or configure via Jenkins credentials
+                git branch: 'main', url: '<YOUR_REPOSITORY_URL>'
+            }
+        }
+        stage('Init') {
+            steps {
+                withAWS(credentials: '<AWS_CREDENTIALS_ID>', region: '<AWS_REGION>') {
+                    sh 'terraform -chdir=eks/ init'
+                }
+            }
+        }
+        stage('Validate') {
+            steps {
+                withAWS(credentials: '<AWS_CREDENTIALS_ID>', region: '<AWS_REGION>') {
+                    sh 'terraform -chdir=eks/ validate'
+                }
+            }
+        }
+        stage('Action') {
+            steps {
+                withAWS(credentials: '<AWS_CREDENTIALS_ID>', region: '<AWS_REGION>') {
+                    script {    
+                        if (params.Terraform_Action == 'plan') {
+                            sh "terraform -chdir=eks/ plan -var-file=${params.Environment}.tfvars"
+                        } else if (params.Terraform_Action == 'apply') {
+                            sh "terraform -chdir=eks/ apply -var-file=${params.Environment}.tfvars -auto-approve"
+                        } else if (params.Terraform_Action == 'destroy') {
+                            sh "terraform -chdir=eks/ destroy -var-file=${params.Environment}.tfvars -auto-approve"
+                        } else {
+                            error "Invalid value for Terraform_Action: ${params.Terraform_Action}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

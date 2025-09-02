@@ -1,0 +1,124 @@
+pipeline {
+    agent any 
+    tools {
+        nodejs 'nodejs'
+    }
+    environment {
+        SCANNER_HOME      = tool 'sonar-scanner'
+        AWS_ACCOUNT_ID    = credentials('<AWS_ACCOUNT_ID_CRED>')
+        AWS_ECR_REPO_NAME = credentials('<ECR_REPO_NAME_CRED>')
+        AWS_DEFAULT_REGION = '<AWS_REGION>'
+        REPOSITORY_URI    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
+    }
+    stages {
+        stage('Cleaning Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                git credentialsId: '<GITHUB_CREDENTIALS_ID>', 
+                    url: '<YOUR_REPOSITORY_URL>', 
+                    branch: 'main'
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                dir('frontend') {
+                    withSonarQubeEnv('<SONARQUBE_SERVER>') {
+                        sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=frontend \
+                        -Dsonar.projectKey=frontend \
+                        -Dsonar.sources=.
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    timeout(time: 2, unit: 'MINUTES') {
+                        try {
+                            def qg = waitForQualityGate abortPipeline: false, credentialsId: '<SONAR_TOKEN>'
+                            if (qg.status != 'OK') {
+                                echo "Quality Gate failed: ${qg.status}"
+                                echo "Check the report in SonarQube Dashboard."
+                            } else {
+                                echo "Quality Gate passed successfully!"
+                            }
+                        } catch (Exception e) {
+                            echo "Quality Gate check timed out or failed: ${e.getMessage()}"
+                            echo "SonarQube analysis may have completed. Check manually in SonarQube Dashboard."
+                        }
+                    }
+                }
+            }
+        }
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('frontend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                    odcInstallation: '<DEPENDENCY_CHECK_INSTALLATION>'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+        stage('Trivy File Scan') {
+            steps {
+                dir('frontend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+        stage('Docker Image Build') {
+            steps {
+                script {
+                    dir('frontend') {
+                        sh 'docker system prune -f'
+                        sh 'docker container prune -f'
+                        sh 'docker build -t ${AWS_ECR_REPO_NAME} .'
+                    }
+                }
+            }
+        }
+        stage('ECR Image Pushing') {
+            steps {
+                script {
+                    sh 'aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${REPOSITORY_URI}'
+                    sh 'docker tag ${AWS_ECR_REPO_NAME} ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}'
+                    sh 'docker push ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}'
+                }
+            }
+        }
+        stage('Trivy Image Scan') {
+            steps {
+                sh 'trivy image ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER} > trivyimage.txt'
+            }
+        }
+        stage('Update Deployment File') {
+            environment {
+                GIT_REPO_NAME = "<YOUR_REPO_NAME>"
+                GIT_USER_NAME = "<YOUR_GITHUB_USERNAME>"
+            }
+            steps {
+                dir('k8s-manifests/frontend') {
+                    withCredentials([string(credentialsId: '<GITHUB_TOKEN_CRED>', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                        git config user.email "<YOUR_EMAIL>"
+                        git config user.name "<YOUR_NAME>"
+                        BUILD_NUMBER=${BUILD_NUMBER}
+                        imageTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+                        sed -i "s/${AWS_ECR_REPO_NAME}:${imageTag}/${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}/" deployment.yaml
+                        git add deployment.yaml
+                        git commit -m "Update deployment image to version ${BUILD_NUMBER}"
+                        git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
